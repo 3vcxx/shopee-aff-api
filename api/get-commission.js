@@ -1,65 +1,255 @@
-export default async function handler(req, res) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
+import requests
+import os
+import json
+import redis
+import re
 
-    if (req.method === 'OPTIONS') return res.status(200).end();
+app = FastAPI()
 
-    const { url } = req.query;
-    if (!url) {
-        return res.status(200).json({ success: false, error: 'Vui lòng cung cấp url sản phẩm' });
-    }
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    const shopeeCookie = process.env.SHOPEE_COOKIE || '_fbp=fb.1.1768914063092.285491066292534011; SPC_F=o9MRymIb55Jsp1RlBZKMmzG33qTDW8Ok; REC_T_ID=12f9a573-f600-11f0-ba33-5a1ef0ad9851; SPC_CLIENTID=bzlNUnltSWI1NUpzoofuhzpwvuufhpgk; language=vi; SPC_SI=wXYnagAAAABiQlJhcmF5Ob2NGgIAAAAAbTV5U2RCMHg=; SPC_ST=MUtwRHZjMVV6RHlmU05vMdWC9K501Yvu5Mey0GnGCOglSShm5q61G/TbLCkJrnMfz6MPi5Bf7Hjo2EGmuYywyS145nqm2DDsHNSqA1dHrE7lWludZeQtvvsWm4Iej30r1Xk/Q951/NfDe9ACKfbse6Bzc7sQlvjqzdh40Z7N/pFj8eh8LOWGLhBbcu2XIz52GU5bxK53IdpRk2BJ83H54Q==.AAJ7f+x5N4DhvYCJjKgkQ9pdxyCE3s4CuJTKCtHE5kcS; SPC_U=283824214; SPC_R_T_ID=D0grqBovtIOM/JYLaFoK3KUdwx04XxnuKS1nU3xhDwl5jrVkfxXpgHIb8KPEBbA//vuzXST9buQ08t3xkp3k3TkP19bgsXF9BSAHu407iuOLuyxv+fX6pXiqqE44zEnQU8r5WMtoJ/rPqmauwc4bnQfggTVAvxpfeUegLRmCuCY=; SPC_R_T_IV=b21XU2ZURnNJbjlZWFpsbw==; SPC_T_ID=D0grqBovtIOM/JYLaFoK3KUdwx04XxnuKS1nU3xhDwl5jrVkfxXpgHIb8KPEBbA//vuzXST9buQ08t3xkp3k3TkP19bgsXF9BSAHu407iuOLuyxv+fX6pXiqqE44zEnQU8r5WMtoJ/rPqmauwc4bnQfggTVAvxpfeUegLRmCuCY=; SPC_T_IV=b21XU2ZURnNJbjlZWFpsbw==; _med=affiliates;';
+# ── Redis Connection ──────────────────────────────────────────
+REDIS_URL = os.getenv("REDIS_URL")
+kv = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+ADMIN_KEY = os.getenv("ADMIN_KEY", "123456")
 
-    try {
-        // Chuẩn hóa link: Loại bỏ toàn bộ tracking rác sau dấu chấm hỏi (?) để Shopee tìm kiếm chính xác nhất
-        const cleanUrl = url.split('?')[0];
-        const encodedKeyword = encodeURIComponent(cleanUrl);
+def get_config() -> dict:
+    if kv:
+        try:
+            raw = kv.get("app_config_py")
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    return {}
 
-        // Gọi API danh sách sản phẩm với từ khóa là link sạch đã được định dạng
-        const apiUrl = `https://affiliate.shopee.vn/api/v3/offer/product/list?list_type=0&sort_type=1&page_offset=0&page_limit=1&client_type=1&keyword=${encodedKeyword}`;
+def set_config(data: dict):
+    if kv:
+        kv.set("app_config_py", json.dumps(data))
 
-        const shopeeResponse = await fetch(apiUrl, {
-            method: 'GET',
-            headers: {
-                'Cookie': shopeeCookie,
-                'Accept': 'application/json, text/plain, */*',
-                'Accept-Language': 'vi-VN,vi;q=0.9',
-                'Referer': 'https://affiliate.shopee.vn/offer/product_offer',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
-            }
-        });
+# ── Models ───────────────────────────────────────────────────
+class LinkBatch(BaseModel):
+    links: List[str]
 
-        const data = await shopeeResponse.json();
+class SingleLink(BaseModel):
+    url: str
 
-        // Trường hợp thành công mỹ mãn
-        if (data.code === 20000 && data.data && data.data.list && data.data.list.length > 0) {
-            const product = data.data.list[0];
-            return res.status(200).json({
-                success: true,
-                data: {
-                    item_id: product.item_id,
-                    shop_id: product.shop_id,
-                    product_name: product.item_name,
-                    image_url: product.image_url,
-                    price: product.price,
-                    commission_rate: product.commission_rate,
-                    seller_commission_rate: product.seller_commission_rate || 0,
-                    estimated_commission: product.commission
-                }
-            });
-        } 
+# ── Helper Functions ─────────────────────────────────────────
+def resolve_shopee_url(url: str) -> str:
+    """Hàm giải mã mã link rút gọn s.shopee.vn ngay trên Render"""
+    if "s.shopee.vn" in url or "shope.ee" in url:
+        try:
+            res = requests.get(
+                url, 
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, 
+                allow_redirects=False, 
+                timeout=10
+            )
+            if "location" in res.headers:
+                return res.headers["location"]
+        except Exception:
+            pass
+    return url
+
+def extract_item_and_shop_id(url: str):
+    """Tách lấy ItemID và ShopID từ link dài bản sạch"""
+    # Dạng 1: -i.SHOP_ID.ITEM_ID
+    match1 = re.search(r'-i\.(\d+)\.(\d+)', url)
+    if match1:
+        return match1.group(1), match1.group(2)
+    
+    # Dạng 2: /product/SHOP_ID/ITEM_ID
+    match2 = re.search(r'\/product\/(\d+)\/(\d+)', url)
+    if match2:
+        return match2.group(1), match2.group(2)
         
-        // Trường hợp API chạy được nhưng trống data hoặc lỗi phân quyền / anti-cheat của Shopee
-        return res.status(200).json({
-            success: false,
-            error: data.data && data.data.list && data.data.list.length === 0 
-                ? 'Shopee không tìm thấy sản phẩm này trong danh mục Affiliate.' 
-                : `Shopee trả về mã lỗi hệ thống: ${data.code}`,
-            shopee_raw: data // Đẩy toàn bộ cục JSON của Shopee về PHP hiển thị để xem lỗi gì
-        });
+    return None, None
 
-    } catch (error) {
-        return res.status(200).json({ success: false, error: 'Lỗi thực thi code tại Vercel: ' + error.message });
+# ── Routes ───────────────────────────────────────────────────
+@app.get("/")
+def home():
+    return {"message": "Shopee Batch Converter & Commission API is Running!"}
+
+@app.get("/config")
+def read_config(key: str = Query("")):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return get_config()
+
+@app.post("/config")
+async def write_config(request: Request, key: str = Query(")):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    body = await request.json()
+    set_config(body)
+    return {"success": True, "message": "Đã cập nhật config"}
+
+@app.post("/convert")
+def convert_batch(data: LinkBatch):
+    links = data.links
+    config = get_config()
+    
+    cookie_entries = config.get("cookies") or config.get("affiliates") or []
+    valid_cookies = []
+    for entry in cookie_entries:
+        ck = entry.get("cookie") or entry.get("id") or ""
+        lb = entry.get("label") or "Voucher Shopee"
+        ck = ck.replace('"', '').replace("'", "").strip()
+        if ck:
+            valid_cookies.append({"label": lb, "cookie": ck})
+
+    if not valid_cookies:
+        env_cookie = os.getenv("SHOPEE_COOKIE", "").replace('"', '').replace("'", "").strip()
+        if env_cookie:
+            valid_cookies.append({"label": "Mặc định (Env)", "cookie": env_cookie})
+
+    if not valid_cookies:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình Cookie!")
+
+    final_results = [{"original": link, "variants": []} for link in links]
+
+    for vc in valid_cookies:
+        payload = {
+            "operationName": "batchGetCustomLink",
+            "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller) { batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller) { shortLink, failCode } }",
+            "variables": {
+                "linkParams": [{"originalLink": l} for l in links],
+                "sourceCaller": "CUSTOM_LINK_CALLER"
+            }
+        }
+        headers = {
+            "content-type": "application/json",
+            "cookie": vc["cookie"],
+            "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+        }
+
+        try:
+            response = requests.post(
+                "https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink",
+                headers=headers, json=payload, timeout=20
+            )
+            data_res = response.json()
+
+            if "data" in data_res and "batchCustomLink" in data_res["data"]:
+                batch_results = data_res["data"]["batchCustomLink"]
+                for idx, item in enumerate(batch_results):
+                    short_link = item.get("shortLink")
+                    if short_link:
+                        final_results[idx]["variants"].append({
+                            "label": vc["label"],
+                            "url": short_link
+                        })
+        except Exception:
+            continue
+
+    return {"status": "success", "results": final_results}
+
+# ── ENDPOINT MỚI: CHECK HOA HỒNG QUA CỔNG GQL ──────────────────
+@app.post("/commission")
+def get_commission(data: SingleLink):
+    raw_url = data.url
+    
+    # 1. Đi tìm 1 cookie hợp lệ để chạy mẫu
+    config = get_config()
+    cookie_entries = config.get("cookies") or config.get("affiliates") or []
+    use_cookie = ""
+    
+    if cookie_entries:
+        use_cookie = cookie_entries[0].get("cookie") or cookie_entries[0].get("id") or ""
+    if not use_cookie:
+        use_cookie = os.getenv("SHOPEE_COOKIE", "")
+        
+    use_cookie = use_cookie.replace('"', '').replace("'", "").strip()
+    if not use_cookie:
+        raise HTTPException(status_code=400, detail="Hệ thống chưa có Cookie Shopee để thực hiện request.")
+
+    # 2. Xử lý bóc tách link
+    long_url = resolve_shopee_url(raw_url)
+    shop_id, item_id = extract_item_and_shop_id(long_url)
+    
+    # Sử dụng ID để tìm kiếm chính xác qua cổng GQL (tránh truyền URL rác)
+    keyword = item_id if item_id else long_url.split('?')[0]
+
+    # 3. Định dạng Payload theo đúng cấu trúc cổng GraphQL của danh sách sản phẩm affiliate
+    payload = {
+        "operationName": "getProductOfferList",
+        "query": """
+            query getProductOfferList($request: ProductOfferListRequest) {
+                productOfferList(request: $request) {
+                    list {
+                        itemId
+                        shopId
+                        itemName
+                        imageUrl
+                        price
+                        commissionRate
+                        sellerCommissionRate
+                        commission
+                    }
+                }
+            }
+        """,
+        "variables": {
+            "request": {
+                "keyword": str(keyword),
+                "listType": 0,
+                "pageOffset": 0,
+                "pageLimit": 1,
+                "sortType": 1,
+                "clientType": 1
+            }
+        }
     }
-}
+
+    headers = {
+        "content-type": "application/json",
+        "cookie": use_cookie,
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    try:
+        response = requests.post(
+            "https://affiliate.shopee.vn/api/v3/gql?q=getProductOfferList",
+            headers=headers, 
+            json=payload, 
+            timeout=15
+        )
+        res_data = response.json()
+        
+        # Kiểm tra cấu trúc dữ liệu trả về từ GraphQL gateway
+        if "data" in res_data and "productOfferList" in res_data["data"]:
+            p_list = res_data["data"]["productOfferList"].get("list") or []
+            if p_list:
+                product = p_list[0]
+                return {
+                    "success": True,
+                    "data": {
+                        "item_id": product.get("itemId"),
+                        "shop_id": product.get("shopId"),
+                        "product_name": product.get("itemName"),
+                        "image_url": product.get("imageUrl"),
+                        "price": product.get("price"),
+                        "commission_rate": product.get("commissionRate"),
+                        "seller_commission_rate": product.get("sellerCommissionRate") or 0,
+                        "estimated_commission": product.get("commission")
+                    }
+                }
+        
+        return {
+            "success": False,
+            "error": "Không tìm thấy thông tin sản phẩm trên hệ thống Affiliate.",
+            "shopee_raw": res_data
+        }
+
+    except Exception as e:
+        return {"success": False, "error": f"Lỗi hệ thống FastAPI: {str(e)}"}
