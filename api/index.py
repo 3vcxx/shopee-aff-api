@@ -1,12 +1,17 @@
+import os
+import json
+import re
+from typing import List
+import requests
+import redis
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
-import requests
-import os
-import json
-import redis
-import re
+from dotenv import load_dotenv
+
+# ── Nạp Biến Môi Trường ───────────────────────────────────────
+# Tự động nạp các biến từ file .env nếu chạy dưới máy cá nhân (Local)
+load_dotenv()
 
 app = FastAPI()
 
@@ -46,12 +51,12 @@ class SingleLink(BaseModel):
 
 # ── Helper Functions ─────────────────────────────────────────
 def resolve_shopee_url(url: str) -> str:
-    """Hàm giải mã mã link rút gọn s.shopee.vn ngay trên Render"""
+    """Giải mã link rút gọn s.shopee.vn / shope.ee thành link gốc dài"""
     if "s.shopee.vn" in url or "shope.ee" in url:
         try:
             res = requests.get(
                 url, 
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, 
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, 
                 allow_redirects=False, 
                 timeout=10
             )
@@ -62,7 +67,7 @@ def resolve_shopee_url(url: str) -> str:
     return url
 
 def extract_item_and_shop_id(url: str):
-    """Tách lấy ItemID và ShopID từ link dài bản sạch"""
+    """Bóc tách ShopID và ItemID từ URL sản phẩm"""
     # Dạng 1: -i.SHOP_ID.ITEM_ID
     match1 = re.search(r'-i\.(\d+)\.(\d+)', url)
     if match1:
@@ -78,7 +83,7 @@ def extract_item_and_shop_id(url: str):
 # ── Routes ───────────────────────────────────────────────────
 @app.get("/")
 def home():
-    return {"message": "Shopee Batch Converter & Commission API is Running!"}
+    return {"message": "Shopee Affiliate GraphQL API is Running Successfully!"}
 
 @app.get("/config")
 def read_config(key: str = Query("")):
@@ -87,19 +92,22 @@ def read_config(key: str = Query("")):
     return get_config()
 
 @app.post("/config")
-async def write_config(request: Request, key: str = Query(")):
+async def write_config(request: Request, key: str = Query("")):
     if key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized")
     body = await request.json()
     set_config(body)
-    return {"success": True, "message": "Đã cập nhật config"}
+    return {"success": True, "message": "Đã cập nhật config thành công"}
 
+# ── ENDPOINT 1: RÚT GỌN LINK BATCH ────────────────────────────
 @app.post("/convert")
 def convert_batch(data: LinkBatch):
     links = data.links
     config = get_config()
     
+    # 1. Gom tất cả cookie từ cấu hình trong Redis
     cookie_entries = config.get("cookies") or config.get("affiliates") or []
+    
     valid_cookies = []
     for entry in cookie_entries:
         ck = entry.get("cookie") or entry.get("id") or ""
@@ -108,16 +116,19 @@ def convert_batch(data: LinkBatch):
         if ck:
             valid_cookies.append({"label": lb, "cookie": ck})
 
+    # Nếu Redis trống, hốt bốc từ Biến môi trường (Env Variable) làm phương án dự phòng
     if not valid_cookies:
         env_cookie = os.getenv("SHOPEE_COOKIE", "").replace('"', '').replace("'", "").strip()
         if env_cookie:
             valid_cookies.append({"label": "Mặc định (Env)", "cookie": env_cookie})
 
     if not valid_cookies:
-        raise HTTPException(status_code=500, detail="Chưa cấu hình Cookie!")
+        raise HTTPException(status_code=500, detail="Hệ thống chưa cấu hình Cookie Shopee!")
 
+    # 2. Định dạng cấu trúc mảng kết quả trả về
     final_results = [{"original": link, "variants": []} for link in links]
 
+    # 3. Lặp qua tất cả cookie để sinh link thông qua GraphQL gateway
     for vc in valid_cookies:
         payload = {
             "operationName": "batchGetCustomLink",
@@ -150,37 +161,39 @@ def convert_batch(data: LinkBatch):
                             "url": short_link
                         })
         except Exception:
-            continue
+            continue  # Gặp cookie lỗi thì bỏ qua chạy tiếp các tài khoản khác
 
     return {"status": "success", "results": final_results}
 
-# ── ENDPOINT MỚI: CHECK HOA HỒNG QUA CỔNG GQL ──────────────────
+# ── ENDPOINT 2: CHECK HOA HỒNG QUA GQL (BẢN SẠCH COOKIE) ──────
 @app.post("/commission")
 def get_commission(data: SingleLink):
     raw_url = data.url
     
-    # 1. Đi tìm 1 cookie hợp lệ để chạy mẫu
+    # 1. Tìm lấy 1 cookie hợp lệ: Ưu tiên bốc từ cấu hình Redis trước
     config = get_config()
     cookie_entries = config.get("cookies") or config.get("affiliates") or []
     use_cookie = ""
     
     if cookie_entries:
         use_cookie = cookie_entries[0].get("cookie") or cookie_entries[0].get("id") or ""
+    
+    # Nếu Redis không cấu hình tài khoản nào, lấy từ Biến môi trường (Env Variable) ra
     if not use_cookie:
         use_cookie = os.getenv("SHOPEE_COOKIE", "")
         
     use_cookie = use_cookie.replace('"', '').replace("'", "").strip()
     if not use_cookie:
-        raise HTTPException(status_code=400, detail="Hệ thống chưa có Cookie Shopee để thực hiện request.")
+        raise HTTPException(status_code=400, detail="Hệ thống chưa cấu hình Cookie Shopee!")
 
-    # 2. Xử lý bóc tách link
+    # 2. Xử lý giải mã Link ngắn và ép lấy chuỗi Item ID làm từ khóa
     long_url = resolve_shopee_url(raw_url)
     shop_id, item_id = extract_item_and_shop_id(long_url)
     
-    # Sử dụng ID để tìm kiếm chính xác qua cổng GQL (tránh truyền URL rác)
+    # Ép dùng Item ID thuần làm keyword để lách bộ quét của tường lửa Shopee
     keyword = item_id if item_id else long_url.split('?')[0]
 
-    # 3. Định dạng Payload theo đúng cấu trúc cổng GraphQL của danh sách sản phẩm affiliate
+    # 3. Định dạng cấu trúc GraphQL của danh sách sản phẩm affiliate
     payload = {
         "operationName": "getProductOfferList",
         "query": """
@@ -226,7 +239,7 @@ def get_commission(data: SingleLink):
         )
         res_data = response.json()
         
-        # Kiểm tra cấu trúc dữ liệu trả về từ GraphQL gateway
+        # Kiểm tra cấu trúc dữ liệu trả về từ GraphQL gateway nội bộ
         if "data" in res_data and "productOfferList" in res_data["data"]:
             p_list = res_data["data"]["productOfferList"].get("list") or []
             if p_list:
