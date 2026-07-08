@@ -1,16 +1,11 @@
-import os
-import json
-import re
-from typing import List
-import requests
-import redis
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import requests
+import os
+import re
 from dotenv import load_dotenv
 
-# ── Nạp Biến Môi Trường ───────────────────────────────────────
-# Tự động nạp các biến từ file .env nếu chạy dưới máy cá nhân (Local)
 load_dotenv()
 
 app = FastAPI()
@@ -23,246 +18,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Redis Connection ──────────────────────────────────────────
-REDIS_URL = os.getenv("REDIS_URL")
-kv = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
-ADMIN_KEY = os.getenv("ADMIN_KEY", "123456")
-
-def get_config() -> dict:
-    if kv:
-        try:
-            raw = kv.get("app_config_py")
-            if raw:
-                return json.loads(raw)
-        except Exception:
-            pass
-    return {}
-
-def set_config(data: dict):
-    if kv:
-        kv.set("app_config_py", json.dumps(data))
-
-# ── Models ───────────────────────────────────────────────────
-class LinkBatch(BaseModel):
-    links: List[str]
-
-class SingleLink(BaseModel):
+class ProductRequest(BaseModel):
     url: str
 
-# ── Helper Functions ─────────────────────────────────────────
 def resolve_shopee_url(url: str) -> str:
-    """Giải mã link rút gọn s.shopee.vn / shope.ee thành link gốc dài"""
+    """Giải mã link ngắn s.shopee.vn thành link dài"""
     if "s.shopee.vn" in url or "shope.ee" in url:
         try:
-            res = requests.get(
-                url, 
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}, 
-                allow_redirects=False, 
-                timeout=10
-            )
+            res = requests.get(url, allow_redirects=False, timeout=10)
             if "location" in res.headers:
                 return res.headers["location"]
         except Exception:
             pass
     return url
 
-def extract_item_and_shop_id(url: str):
-    """Bóc tách ShopID và ItemID từ URL sản phẩm"""
-    # Dạng 1: -i.SHOP_ID.ITEM_ID
-    match1 = re.search(r'-i\.(\d+)\.(\d+)', url)
-    if match1:
-        return match1.group(1), match1.group(2)
-    
-    # Dạng 2: /product/SHOP_ID/ITEM_ID
+def extract_item_id(url: str) -> str:
+    """Tách lấy Item ID từ link sản phẩm để làm từ khóa tìm kiếm chuẩn nhất"""
+    match = re.search(r'-i\.(\d+)\.(\d+)', url)
+    if match:
+        return match.group(2)
     match2 = re.search(r'\/product\/(\d+)\/(\d+)', url)
     if match2:
-        return match2.group(1), match2.group(2)
-        
-    return None, None
+        return match2.group(2)
+    # Nếu không tách được ID, lấy phần link trước dấu ?
+    return url.split('?')[0]
 
-# ── Routes ───────────────────────────────────────────────────
 @app.get("/")
 def home():
-    return {"message": "Shopee Affiliate GraphQL API is Running Successfully!"}
+    return {"message": "API Check Hoa Hồng Shopee đang chạy!"}
 
-@app.get("/config")
-def read_config(key: str = Query("")):
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return get_config()
+@app.post("/check-product")
+def check_product(data: ProductRequest):
+    # 1. Bốc cookie an toàn từ biến môi trường
+    cookie = os.getenv("SHOPEE_COOKIE", "").replace('"', '').replace("'", "").strip()
+    if not cookie:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình SHOPEE_COOKIE trên server!")
 
-@app.post("/config")
-async def write_config(request: Request, key: str = Query("")):
-    if key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    body = await request.json()
-    set_config(body)
-    return {"success": True, "message": "Đã cập nhật config thành công"}
-
-# ── ENDPOINT 1: RÚT GỌN LINK BATCH ────────────────────────────
-@app.post("/convert")
-def convert_batch(data: LinkBatch):
-    links = data.links
-    config = get_config()
-    
-    # 1. Gom tất cả cookie từ cấu hình trong Redis
-    cookie_entries = config.get("cookies") or config.get("affiliates") or []
-    
-    valid_cookies = []
-    for entry in cookie_entries:
-        ck = entry.get("cookie") or entry.get("id") or ""
-        lb = entry.get("label") or "Voucher Shopee"
-        ck = ck.replace('"', '').replace("'", "").strip()
-        if ck:
-            valid_cookies.append({"label": lb, "cookie": ck})
-
-    # Nếu Redis trống, hốt bốc từ Biến môi trường (Env Variable) làm phương án dự phòng
-    if not valid_cookies:
-        env_cookie = os.getenv("SHOPEE_COOKIE", "").replace('"', '').replace("'", "").strip()
-        if env_cookie:
-            valid_cookies.append({"label": "Mặc định (Env)", "cookie": env_cookie})
-
-    if not valid_cookies:
-        raise HTTPException(status_code=500, detail="Hệ thống chưa cấu hình Cookie Shopee!")
-
-    # 2. Định dạng cấu trúc mảng kết quả trả về
-    final_results = [{"original": link, "variants": []} for link in links]
-
-    # 3. Lặp qua tất cả cookie để sinh link thông qua GraphQL gateway
-    for vc in valid_cookies:
-        payload = {
-            "operationName": "batchGetCustomLink",
-            "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller) { batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller) { shortLink, failCode } }",
-            "variables": {
-                "linkParams": [{"originalLink": l} for l in links],
-                "sourceCaller": "CUSTOM_LINK_CALLER"
-            }
-        }
-        headers = {
-            "content-type": "application/json",
-            "cookie": vc["cookie"],
-            "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-        }
-
-        try:
-            response = requests.post(
-                "https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink",
-                headers=headers, json=payload, timeout=20
-            )
-            data_res = response.json()
-
-            if "data" in data_res and "batchCustomLink" in data_res["data"]:
-                batch_results = data_res["data"]["batchCustomLink"]
-                for idx, item in enumerate(batch_results):
-                    short_link = item.get("shortLink")
-                    if short_link:
-                        final_results[idx]["variants"].append({
-                            "label": vc["label"],
-                            "url": short_link
-                        })
-        except Exception:
-            continue  # Gặp cookie lỗi thì bỏ qua chạy tiếp các tài khoản khác
-
-    return {"status": "success", "results": final_results}
-
-# ── ENDPOINT 2: CHECK HOA HỒNG QUA GQL (BẢN SẠCH COOKIE) ──────
-@app.post("/commission")
-def get_commission(data: SingleLink):
-    raw_url = data.url
-    
-    # 1. Tìm lấy 1 cookie hợp lệ: Ưu tiên bốc từ cấu hình Redis trước
-    config = get_config()
-    cookie_entries = config.get("cookies") or config.get("affiliates") or []
-    use_cookie = ""
-    
-    if cookie_entries:
-        use_cookie = cookie_entries[0].get("cookie") or cookie_entries[0].get("id") or ""
-    
-    # Nếu Redis không cấu hình tài khoản nào, lấy từ Biến môi trường (Env Variable) ra
-    if not use_cookie:
-        use_cookie = os.getenv("SHOPEE_COOKIE", "")
-        
-    use_cookie = use_cookie.replace('"', '').replace("'", "").strip()
-    if not use_cookie:
-        raise HTTPException(status_code=400, detail="Hệ thống chưa cấu hình Cookie Shopee!")
-
-    # 2. Xử lý giải mã Link ngắn và ép lấy chuỗi Item ID làm từ khóa
-    long_url = resolve_shopee_url(raw_url)
-    shop_id, item_id = extract_item_and_shop_id(long_url)
-    
-    # Ép dùng Item ID thuần làm keyword để lách bộ quét của tường lửa Shopee
-    keyword = item_id if item_id else long_url.split('?')[0]
-
-    # 3. Định dạng cấu trúc GraphQL của danh sách sản phẩm affiliate
-    payload = {
-        "operationName": "getProductOfferList",
-        "query": """
-            query getProductOfferList($request: ProductOfferListRequest) {
-                productOfferList(request: $request) {
-                    list {
-                        itemId
-                        shopId
-                        itemName
-                        imageUrl
-                        price
-                        commissionRate
-                        sellerCommissionRate
-                        commission
-                    }
-                }
-            }
-        """,
-        "variables": {
-            "request": {
-                "keyword": str(keyword),
-                "listType": 0,
-                "pageOffset": 0,
-                "pageLimit": 1,
-                "sortType": 1,
-                "clientType": 1
-            }
-        }
-    }
+    # 2. Xử lý Link đầu vào
+    long_url = resolve_shopee_url(data.url)
+    keyword = extract_item_id(long_url)
 
     headers = {
-        "content-type": "application/json",
-        "cookie": use_cookie,
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "Cookie": cookie
+    }
+
+    # 3. Gọi API 1: Lấy hoa hồng Shopee (list_type=0)
+    url_shopee = f"https://affiliate.shopee.vn/api/v3/offer/product/list?list_type=0&sort_type=1&page_offset=0&page_limit=1&client_type=1&keyword={keyword}"
+    
+    # 4. Gọi API 2: Lấy hoa hồng Xtra / Người bán (list_type=7)
+    url_xtra = f"https://affiliate.shopee.vn/api/v3/offer/product/list?list_type=7&sort_type=1&page_offset=0&page_limit=1&client_type=1&keyword={keyword}"
+
+    product_data = {
+        "name": "Không tìm thấy sản phẩm",
+        "image": "",
+        "price": 0,
+        "shopee_commission_rate": 0,
+        "shopee_commission_value": 0,
+        "xtra_commission_rate": 0,
+        "xtra_commission_value": 0,
+        "total_commission": 0
     }
 
     try:
-        response = requests.post(
-            "https://affiliate.shopee.vn/api/v3/gql?q=getProductOfferList",
-            headers=headers, 
-            json=payload, 
-            timeout=15
-        )
-        res_data = response.json()
-        
-        # Kiểm tra cấu trúc dữ liệu trả về từ GraphQL gateway nội bộ
-        if "data" in res_data and "productOfferList" in res_data["data"]:
-            p_list = res_data["data"]["productOfferList"].get("list") or []
-            if p_list:
-                product = p_list[0]
-                return {
-                    "success": True,
-                    "data": {
-                        "item_id": product.get("itemId"),
-                        "shop_id": product.get("shopId"),
-                        "product_name": product.get("itemName"),
-                        "image_url": product.get("imageUrl"),
-                        "price": product.get("price"),
-                        "commission_rate": product.get("commissionRate"),
-                        "seller_commission_rate": product.get("sellerCommissionRate") or 0,
-                        "estimated_commission": product.get("commission")
-                    }
-                }
-        
-        return {
-            "success": False,
-            "error": "Không tìm thấy thông tin sản phẩm trên hệ thống Affiliate.",
-            "shopee_raw": res_data
-        }
+        # Bắn API Shopee thường
+        res_shopee = requests.get(url_shopee, headers=headers, timeout=15).json()
+        if "data" in res_shopee and res_shopee["data"].get("list"):
+            p = res_shopee["data"]["list"][0]
+            product_data["name"] = p.get("item_name")
+            product_data["image"] = p.get("image_url")
+            product_data["price"] = p.get("price", 0)
+            product_data["shopee_commission_rate"] = p.get("commission_rate", 0)
+            product_data["shopee_commission_value"] = p.get("commission", 0)
+
+        # Bắn API Xtra
+        res_xtra = requests.get(url_xtra, headers=headers, timeout=15).json()
+        if "data" in res_xtra and res_xtra["data"].get("list"):
+            p_xtra = res_xtra["data"]["list"][0]
+            product_data["xtra_commission_rate"] = p_xtra.get("commission_rate", 0)
+            product_data["xtra_commission_value"] = p_xtra.get("commission", 0)
+
+        # Tính tổng hoa hồng thực nhận
+        product_data["total_commission"] = product_data["shopee_commission_value"] + product_data["xtra_commission_value"]
+
+        return {"success": True, "product": product_data}
 
     except Exception as e:
-        return {"success": False, "error": f"Lỗi hệ thống FastAPI: {str(e)}"}
+        return {"success": False, "error": str(e)}
